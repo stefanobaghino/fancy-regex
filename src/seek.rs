@@ -572,4 +572,323 @@ mod tests {
         // `(a\Z)\1` — seek = `(?:a\n*$)` (group) + `(?:a\n*)` (backref, \Z anchor dropped, newline matching kept)
         assert_eq!(get_seek_pattern(r"(a\Z)\1"), r"(?:a\n*$)(?:a\n*)");
     }
+
+    // ------------------------------------------------------------------
+    // Diagnostic tests for PR #249 (seek false-negatives on top-level
+    // (?=X) lookaheads). Each test:
+    //   1. Builds the seek over-approximation via build_seek_pattern.
+    //   2. Runs that approximation through META, PikeVM, and lazy DFA on
+    //      the failing haystack from the syntest.
+    //   3. Reports the leftmost positions side-by-side and asserts the
+    //      approximation, when correctly searched, includes the position
+    //      where the original pattern matches.
+    //
+    // Verdict guide:
+    //   - All three engines agree on a position past expected_leftmost
+    //     => over-approximation is too narrow (the bug is in seek.rs).
+    //   - META differs from PikeVM/DFA => regex-automata META leftmost bug.
+    //   - All three agree on expected_leftmost => bug is elsewhere
+    //     (vm.rs Insn::Seek handling, or syntect-side).
+
+    fn diagnostic_for(case: &str, pattern: &str, haystack: &str, expected_leftmost: usize) {
+        let mut tree = Expr::parse_tree(pattern).expect("parse_tree");
+        // Apply optimize_trailing_lookahead — this is the transform that turns
+        // a top-level `(?=X)` into `Concat([Group(Empty), X])`, which is the
+        // exact shape PR #249 disables seek for.
+        let requires_capture_group_fixup = crate::optimize::optimize(&mut tree);
+        let info = analyze(
+            &tree,
+            AnalyzeContext {
+                explicit_capture_group_0: requires_capture_group_fixup,
+                ..AnalyzeContext::default()
+            },
+        )
+        .expect("analyze");
+        let mut group_info_map = Map::new();
+        populate_group_info_map(&mut group_info_map, &info);
+        let mut buf = String::new();
+        build_seek_pattern(&info, &group_info_map, 0, &mut buf, 0);
+        let approximation = &buf;
+
+        let meta_pos = regex_automata::meta::Regex::new(approximation)
+            .ok()
+            .and_then(|r| r.find(haystack.as_bytes()))
+            .map(|m| m.start());
+
+        let pikevm_pos = {
+            use regex_automata::nfa::thompson::pikevm::PikeVM;
+            PikeVM::new(approximation).ok().and_then(|pv| {
+                let mut cache = pv.create_cache();
+                pv.find_iter(&mut cache, regex_automata::Input::new(haystack.as_bytes()))
+                    .next()
+                    .map(|m| m.start())
+            })
+        };
+
+        let dfa_pos = {
+            use regex_automata::hybrid::regex::Regex as HybridRegex;
+            HybridRegex::new(approximation).ok().and_then(|r| {
+                let mut cache = r.create_cache();
+                r.find(&mut cache, regex_automata::Input::new(haystack.as_bytes()))
+                    .map(|m| m.start())
+            })
+        };
+
+        eprintln!("\n========== {} ==========", case);
+        eprintln!("pattern (original):");
+        eprintln!("  {}", pattern);
+        eprintln!("approximation (seek string):");
+        eprintln!("  {}", approximation);
+        eprintln!("haystack ({} bytes):", haystack.len());
+        eprintln!("  {:?}", haystack);
+        eprintln!("expected leftmost: {}", expected_leftmost);
+        eprintln!("META:   {:?}", meta_pos);
+        eprintln!("PikeVM: {:?}", pikevm_pos);
+        eprintln!("DFA:    {:?}", dfa_pos);
+    }
+
+    // Pattern from C++.sublime-syntax line 846 ('generic-type' context, the
+    // SECOND lookahead — without the trailing \s*(\(|\{) that line 787 has).
+    // Line 846 is the one that triggers the seek divergence in syntest.
+    //
+    // Captured verbatim from syntect's regex.rs::search instrumentation while
+    // running `cargo run --example syntest -- testdata/Packages/C++` with
+    // .seek(true): syntect's variable resolver expands [[:alpha:]] → \p{L}.
+    //
+    // Failing assertion: testdata/Packages/C++/syntax_test_cpp.cpp:843, col 29
+    // (the first `<` in `<A<B<C>>()`) is mis-scoped as
+    // keyword.operator.comparison.c instead of
+    // punctuation.definition.generic.begin.c++.
+    const CPP_GENERIC_TYPE_LOOKAHEAD: &str = concat!(
+        r"(?=(?!template)",
+        r"(?:::\s*)?(?:\b[\p{L}_][\p{L}\p{N}_]*\b\s*::\s*)*(?:template\s+)?\b[\p{L}_][\p{L}\p{N}_]*\b",
+        r"\s*",
+        r"<(?:[^(){}&;*^%=<>-]+(?:<(?:[^(){}&;*^%=<>-]+(?:<[^(){}&;*^%=<>-]*>)?)?\s*>)?)?",
+        r"[^(){}&;*^%=<>-]*(?:\([^(){}&;*^%=<>-]*\))?[^(){}&;*^%=<>-]*>",
+        r")",
+    );
+
+    // Line 843 of syntax_test_cpp.cpp + trailing newline (syntect feeds the
+    // line including its '\n' to the regex).
+    const CPP_HAYSTACK: &str =
+        "    auto f = [](std::function<A<B<C>>()> g) { return g(); };\n";
+    // Position of 's' in `std::function` — where path_lookahead first matches.
+    // Confirmed by syntect's seek=false call: returns Some(16).
+    const CPP_EXPECTED: usize = 16;
+
+    #[test]
+    fn diagnostic_seek_cpp_template_angle_bracket() {
+        diagnostic_for(
+            "C++ generic-type lookahead",
+            CPP_GENERIC_TYPE_LOOKAHEAD,
+            CPP_HAYSTACK,
+            CPP_EXPECTED,
+        );
+    }
+
+    // Objective-C++.sublime-syntax line 46 defines `generic_lookahead` with the
+    // same body as C++. The failing line in syntax_test_objc++.mm:830 is C++
+    // code embedded in an .mm file; the same pattern + same haystack span.
+    #[test]
+    fn diagnostic_seek_objcpp_template_angle_bracket() {
+        diagnostic_for(
+            "ObjC++ generic-type lookahead (== C++)",
+            CPP_GENERIC_TYPE_LOOKAHEAD,
+            CPP_HAYSTACK,
+            CPP_EXPECTED,
+        );
+    }
+
+    // Pattern captured verbatim from syntect's regex.rs::search instrumentation
+    // while running `cargo run --example syntest -- testdata/Packages/Makefile`
+    // with .seek(true). The original syntect form is `(?={{rule_lookahead}})`
+    // = `(?={{just_eat}}{{ruleassign}})` from Makefile.sublime-syntax line 122.
+    //
+    // The (?x) is INSIDE the (?=...) group (between `(?=` and the body) and
+    // the ASCII-art comments are preserved — both matter, because the way
+    // (?x) interacts with the comment text affects how the over-approximation
+    // is built. Use a raw byte-equivalent form rather than reconstructing.
+    //
+    // Failing assertions: testdata/Packages/Makefile/syntax_test_makefile.mak
+    // lines 732 ($(a:b=c) : d) and 740 ($(X:a=b) : w ;) — expect-rule context
+    // not pushed.
+    const MAKEFILE_RULE_LOOKAHEAD: &str = "(?=(?x)              # ignore whitespace in this regex\n  [^()=]*        #       level 0\n  (?:\\(        # start level 1                      __\n    [^()]*       #       level 1          _______    /*_>-<\n    (?:\\(      # start level 2      ___/ _____ \\__/ /\n      [^()]*     #       level 2     <____/     \\____/\n      (?:\\(    # start level 3     is like snek... (by Valerie Haecky)\n        [^()]*   #       level 3\n        (?:\\(  # start level 4\n          [^()]* #       level 4\n        \\))? #   end level 4\n        [^()]*   #       level 3\n      \\))?   #   end level 3\n      [^()]*     #       level 2\n      (?:\\(    # start level 3\n        [^()]*   #       level 3\n        (?:\\(  # start level 4\n          [^()]* #       level 4\n        \\))? #   end level 4\n        [^()]*   #       level 3\n      \\))?   #   end level 3\n      [^()]*     #       level 2\n    \\))?     #   end level 2\n    [^()]*       #       level 1\n    (?:\\(      # start level 2\n      [^()]*     #       level 2\n      (?:\\(    # start level 3\n        [^()]*   #       level 3\n        (?:\\(  # start level 4\n          [^()]* #       level 4\n        \\))? #   end level 4\n        [^()]*   #       level 3\n      \\))?   #   end level 3\n      [^()]*     #       level 2\n      (?:\\(    # start level 3\n        [^()]*   #       level 3\n        (?:\\(  # start level 4\n          [^()]* #       level 4\n        \\))? #   end level 4\n        [^()]*   #       level 3\n      \\))?   #   end level 3\n      [^()]*     #       level 2\n      (?:\\(    # start level 3\n        [^()]*   #       level 3\n        (?:\\(  # start level 4\n          [^()]* #       level 4\n        \\))? #   end level 4\n        [^()]*   #       level 3\n      \\))?   #   end level 3\n      [^()]*     #       level 2\n    \\))?     #   end level 2\n    [^()]*       #       level 1\n  \\))?       #   end level 1\n  [^()=]*        #       level 0\n:(?!=))";
+
+    // Includes trailing newline that syntect feeds along with the line.
+    const MAKEFILE_HAYSTACK: &str = "$(a:b=c) : d\n";
+    // Confirmed by syntect's seek=false call: returns Some(0).
+    const MAKEFILE_EXPECTED: usize = 0;
+
+    #[test]
+    fn diagnostic_seek_makefile_rule_lookahead() {
+        diagnostic_for(
+            "Makefile rule_lookahead",
+            MAKEFILE_RULE_LOOKAHEAD,
+            MAKEFILE_HAYSTACK,
+            MAKEFILE_EXPECTED,
+        );
+    }
+
+    // Sanity check: reproduce the failure at the regex level on this checkout
+    // (fancy-regex main, with the buggy seek). For each case, .seek(false)
+    // should find expected_leftmost; .seek(true) should miss it (or find a
+    // wrong position) — confirming the bug is in seek, not elsewhere.
+    fn sanity_for(case: &str, pattern: &str, haystack: &str, expected_leftmost: usize) {
+        use crate::RegexBuilder;
+        let off = RegexBuilder::new(pattern)
+            .oniguruma_mode(true)
+            .build()
+            .expect("build seek=false")
+            .find_from_pos(haystack, 0)
+            .expect("find seek=false")
+            .map(|m| m.start());
+        let on = RegexBuilder::new(pattern)
+            .oniguruma_mode(true)
+            .seek(true)
+            .build()
+            .expect("build seek=true")
+            .find_from_pos(haystack, 0)
+            .expect("find seek=true")
+            .map(|m| m.start());
+        eprintln!("--- sanity {} ---", case);
+        eprintln!("expected leftmost: {}", expected_leftmost);
+        eprintln!("seek=false: {:?}", off);
+        eprintln!("seek=true:  {:?}", on);
+    }
+
+    #[test]
+    fn diagnostic_sanity_cpp() {
+        sanity_for("C++", CPP_GENERIC_TYPE_LOOKAHEAD, CPP_HAYSTACK, CPP_EXPECTED);
+    }
+
+    #[test]
+    fn diagnostic_sanity_makefile() {
+        sanity_for(
+            "Makefile",
+            MAKEFILE_RULE_LOOKAHEAD,
+            MAKEFILE_HAYSTACK,
+            MAKEFILE_EXPECTED,
+        );
+    }
+
+    // Probe the original pattern at every position from 0 to 32 (or len).
+    // For each position p, report whether the original pattern matches when
+    // anchored at p (i.e., does the lookahead succeed if the parser is at p?).
+    fn probe_positions(case: &str, pattern: &str, haystack: &str) {
+        use crate::RegexBuilder;
+        let re_off = RegexBuilder::new(pattern)
+            .oniguruma_mode(true)
+            .build()
+            .expect("build");
+        let re_on = RegexBuilder::new(pattern)
+            .oniguruma_mode(true)
+            .seek(true)
+            .build()
+            .expect("build seek");
+        eprintln!("\n--- positions {} ---", case);
+        let limit = haystack.len().min(45);
+        for p in 0..=limit {
+            let off = re_off
+                .find_from_pos(haystack, p)
+                .ok()
+                .and_then(|m| m)
+                .map(|m| m.start());
+            let on = re_on
+                .find_from_pos(haystack, p)
+                .ok()
+                .and_then(|m| m)
+                .map(|m| m.start());
+            if off != on {
+                eprintln!(
+                    "  pos {:3}: seek=false → {:?}  seek=true → {:?}  *** DIFFER ***",
+                    p, off, on
+                );
+            } else {
+                eprintln!("  pos {:3}: {:?}", p, off);
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_probe_cpp() {
+        probe_positions("C++", CPP_GENERIC_TYPE_LOOKAHEAD, CPP_HAYSTACK);
+    }
+
+    #[test]
+    fn diagnostic_probe_makefile() {
+        probe_positions("Makefile", MAKEFILE_RULE_LOOKAHEAD, MAKEFILE_HAYSTACK);
+    }
+
+    // syntect calls captures_from_pos(&text[..end], begin) — the haystack is
+    // clipped at `end`. Try the C++ case at clipping boundaries that bracket
+    // the actual `(` at pos 37 (the `(` the lookahead body needs to see).
+    // Probe full captures, not just start position. Bug could manifest as
+    // different capture group bounds even when find_from_pos starts agree.
+    #[test]
+    fn diagnostic_probe_cpp_captures() {
+        use crate::RegexBuilder;
+        let re_off = RegexBuilder::new(CPP_GENERIC_TYPE_LOOKAHEAD)
+            .oniguruma_mode(true)
+            .build()
+            .expect("build");
+        let re_on = RegexBuilder::new(CPP_GENERIC_TYPE_LOOKAHEAD)
+            .oniguruma_mode(true)
+            .seek(true)
+            .build()
+            .expect("build seek");
+        eprintln!("\n--- C++ captures ---");
+        for begin in [0usize, 16, 29, 30] {
+            let off = re_off.captures_from_pos(CPP_HAYSTACK, begin).expect("c off");
+            let on = re_on.captures_from_pos(CPP_HAYSTACK, begin).expect("c on");
+            let off_caps: alloc::vec::Vec<_> = off
+                .as_ref()
+                .map(|c| (0..c.len()).map(|i| c.get(i).map(|m| (m.start(), m.end()))).collect())
+                .unwrap_or_default();
+            let on_caps: alloc::vec::Vec<_> = on
+                .as_ref()
+                .map(|c| (0..c.len()).map(|i| c.get(i).map(|m| (m.start(), m.end()))).collect())
+                .unwrap_or_default();
+            let differ = if off_caps != on_caps { " *** DIFFER ***" } else { "" };
+            eprintln!("  begin={:3}: seek=false → {:?}", begin, off_caps);
+            eprintln!("  begin={:3}: seek=true  → {:?}{}", begin, on_caps, differ);
+        }
+    }
+
+    #[test]
+    fn diagnostic_probe_cpp_clipped() {
+        use crate::RegexBuilder;
+        let re_off = RegexBuilder::new(CPP_GENERIC_TYPE_LOOKAHEAD)
+            .oniguruma_mode(true)
+            .build()
+            .expect("build");
+        let re_on = RegexBuilder::new(CPP_GENERIC_TYPE_LOOKAHEAD)
+            .oniguruma_mode(true)
+            .seek(true)
+            .build()
+            .expect("build seek");
+        eprintln!("\n--- C++ clipped haystack ---");
+        for end in [30usize, 37, 38, 39, 40, 44, 45, 60] {
+            for begin in [0usize, 16, 29] {
+                if begin > end {
+                    continue;
+                }
+                let clipped = &CPP_HAYSTACK[..end];
+                let off = re_off
+                    .find_from_pos(clipped, begin)
+                    .ok()
+                    .and_then(|m| m)
+                    .map(|m| m.start());
+                let on = re_on
+                    .find_from_pos(clipped, begin)
+                    .ok()
+                    .and_then(|m| m)
+                    .map(|m| m.start());
+                let differ = if off != on { " *** DIFFER ***" } else { "" };
+                eprintln!(
+                    "  end={:3} begin={:3}: seek=false → {:?}  seek=true → {:?}{}",
+                    end, begin, off, on, differ
+                );
+            }
+        }
+    }
 }
